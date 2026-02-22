@@ -37,7 +37,10 @@ log = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 # ntfy.sh – free push notifications, no account needed
 # Pick any secret topic name, e.g. "chipotle-hunter-abc123"
-NTFY_TOPIC    = os.getenv("NTFY_TOPIC", "")         # e.g. chipotle-codes-abc123
+NTFY_TOPIC          = os.getenv("NTFY_TOPIC", "")         # e.g. chipotle-codes-abc123
+# Name of your Apple Shortcut that accepts the code as text input.
+# Leave blank to skip the action button.
+SHORTCUT_NAME       = os.getenv("SHORTCUT_NAME", "")      # e.g. "Chipotle Code"
 
 # Email (optional – leave blank to skip)
 SMTP_HOST     = os.getenv("SMTP_HOST", "smtp.gmail.com")
@@ -213,15 +216,32 @@ def send_ntfy(code: str, tweet_snippet: str) -> bool:
         return False
     url = f"https://ntfy.sh/{NTFY_TOPIC}"
     payload = f"CODE: {code}\n\n{tweet_snippet[:200]}".encode()
+
+    headers = {
+        "Title": f"Chipotle Code: {code}",
+        "Priority": "urgent",
+        "Tags": "chipotle,tada",
+        "Content-Type": "text/plain",
+    }
+
+    # Add a tap-to-run action button if a Shortcut name is configured.
+    # iOS URL scheme: shortcuts://run-shortcut?name=NAME&input=text&text=CODE
+    # Tapping "Send Code" in the notification opens your Shortcut with the
+    # code already passed in as the input text.
+    if SHORTCUT_NAME:
+        from urllib.parse import quote
+        shortcut_url = (
+            f"shortcuts://run-shortcut"
+            f"?name={quote(SHORTCUT_NAME)}"
+            f"&input=text"
+            f"&text={quote(code)}"
+        )
+        headers["Actions"] = f"view, Send Code to Shortcut, {shortcut_url}"
+
     req = Request(
         url,
         data=payload,
-        headers={
-            "Title": f"Chipotle Code: {code}",
-            "Priority": "urgent",
-            "Tags": "chipotle,tada",
-            "Content-Type": "text/plain",
-        },
+        headers=headers,
         method="POST",
     )
     try:

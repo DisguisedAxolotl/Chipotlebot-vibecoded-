@@ -32,7 +32,17 @@ No account needed. Free. Works great with Apple Shortcuts.
 3. In the ntfy app, tap **+** and subscribe to that same topic name
 4. Done — you'll get an instant push when a code is found
 
-Apple Shortcuts can also react to ntfy notifications via the **ntfy app automations**.
+#### Shortcut deep-link (tap → code auto-sent)
+
+1. In the **Shortcuts app**, create a new Shortcut named e.g. `Chipotle Code`
+2. Add these actions:
+   - **Receive input from** → Quick Actions, Share Sheet, Shortcuts app
+   - **Send Message** → body = `Shortcut Input` → to yourself
+     *(or Copy to Clipboard, or whatever you want)*
+3. In `.env`, set `SHORTCUT_NAME=Chipotle Code`
+
+Now when the ntfy notification arrives, tap **"Send Code to Shortcut"** and
+iOS instantly runs your Shortcut with the code as the input — no copy-paste needed.
 
 ### Option B – Poll the local HTTP server
 
