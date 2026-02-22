@@ -2,8 +2,10 @@
 """
 Chipotle code watcher
 Polls @ChipotleTweets on X every few minutes, extracts promo codes,
-sends an email, and serves the latest code on http://localhost:8080/code
-so Apple Shortcuts can GET it with "Get Contents of URL".
+pushes a notification via ntfy.sh (free, no account needed), and serves
+the latest code at http://localhost:8080/code for Apple Shortcuts polling.
+
+Optional: also sends email if SMTP credentials are set.
 """
 
 import os
@@ -17,6 +19,7 @@ from email.mime.text import MIMEText
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from urllib.request import urlopen, Request
 from urllib.error import URLError
+from urllib.parse import urlencode
 from html.parser import HTMLParser
 
 from dotenv import load_dotenv
@@ -32,11 +35,17 @@ log = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 # Config (all from .env)
 # ---------------------------------------------------------------------------
+# ntfy.sh – free push notifications, no account needed
+# Pick any secret topic name, e.g. "chipotle-hunter-abc123"
+NTFY_TOPIC    = os.getenv("NTFY_TOPIC", "")         # e.g. chipotle-codes-abc123
+
+# Email (optional – leave blank to skip)
 SMTP_HOST     = os.getenv("SMTP_HOST", "smtp.gmail.com")
 SMTP_PORT     = int(os.getenv("SMTP_PORT", "587"))
-SMTP_USER     = os.getenv("SMTP_USER", "")          # your Gmail address
-SMTP_PASS     = os.getenv("SMTP_PASS", "")          # Gmail App Password
-NOTIFY_EMAIL  = os.getenv("NOTIFY_EMAIL", "")       # where to send the code
+SMTP_USER     = os.getenv("SMTP_USER", "")
+SMTP_PASS     = os.getenv("SMTP_PASS", "")
+NOTIFY_EMAIL  = os.getenv("NOTIFY_EMAIL", "")
+
 HTTP_PORT     = int(os.getenv("HTTP_PORT", "8080"))
 POLL_SECONDS  = int(os.getenv("POLL_SECONDS", "300"))  # default: 5 min
 
@@ -197,7 +206,36 @@ def get_all_tweet_texts() -> list[str]:
 
 
 # ---------------------------------------------------------------------------
-# Email
+# ntfy.sh – push notification (no account needed)
+# ---------------------------------------------------------------------------
+def send_ntfy(code: str, tweet_snippet: str) -> bool:
+    if not NTFY_TOPIC:
+        return False
+    url = f"https://ntfy.sh/{NTFY_TOPIC}"
+    payload = f"CODE: {code}\n\n{tweet_snippet[:200]}".encode()
+    req = Request(
+        url,
+        data=payload,
+        headers={
+            "Title": f"Chipotle Code: {code}",
+            "Priority": "urgent",
+            "Tags": "chipotle,tada",
+            "Content-Type": "text/plain",
+        },
+        method="POST",
+    )
+    try:
+        with urlopen(req, timeout=10) as r:
+            r.read()
+        log.info("ntfy.sh notification sent for code: %s", code)
+        return True
+    except Exception as e:
+        log.error("ntfy.sh failed: %s", e)
+        return False
+
+
+# ---------------------------------------------------------------------------
+# Email (optional)
 # ---------------------------------------------------------------------------
 def send_email(code: str, tweet_snippet: str) -> bool:
     if not all([SMTP_USER, SMTP_PASS, NOTIFY_EMAIL]):
@@ -280,8 +318,10 @@ def main():
     http_thread.start()
 
     log.info(
-        "Watcher started. Polling @%s every %ds. Email → %s",
-        CHIPOTLE_HANDLE, POLL_SECONDS, NOTIFY_EMAIL or "(not configured)",
+        "Watcher started. Polling @%s every %ds. ntfy → %s | Email → %s",
+        CHIPOTLE_HANDLE, POLL_SECONDS,
+        NTFY_TOPIC or "(not configured)",
+        NOTIFY_EMAIL or "(not configured)",
     )
 
     while True:
@@ -300,6 +340,7 @@ def main():
                             latest_code["code"] = code
                             latest_code["context"] = snippet
                             latest_code["found_at"] = time.strftime("%Y-%m-%d %H:%M:%S")
+                        send_ntfy(code, snippet)
                         send_email(code, snippet)
         except Exception as e:
             log.error("Poll error: %s", e)

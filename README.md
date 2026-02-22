@@ -10,8 +10,8 @@ and serves the latest code at `http://localhost:8080/code` for Apple Shortcuts.
 pip install -r requirements.txt
 
 # 2. Copy and fill in credentials
-cp .env.example .env
-open -e .env      # or nano .env
+cp env.example .env
+open -e .env      # or: nano .env
 
 # 3. Run it
 python watch.py
@@ -21,25 +21,25 @@ The terminal will log every poll. Leave it open tonight.
 
 ---
 
-## Gmail App Password (30 seconds)
+## Notification setup (pick one)
 
-1. Go to [myaccount.google.com/apppasswords](https://myaccount.google.com/apppasswords)
-2. Click **Create** → name it "Chipotle Bot"
-3. Copy the 16-char password → paste into `SMTP_PASS` in `.env`
+### Option A – ntfy.sh push notification (EASIEST, recommended)
 
----
+No account needed. Free. Works great with Apple Shortcuts.
 
-## Apple Shortcuts setup
+1. Install the free **[ntfy app](https://apps.apple.com/app/ntfy/id1625396347)** on your iPhone
+2. In `.env`, set `NTFY_TOPIC` to any secret string, e.g. `chipotle-free-bowl-abc987`
+3. In the ntfy app, tap **+** and subscribe to that same topic name
+4. Done — you'll get an instant push when a code is found
 
-### Option A – Email trigger (simplest)
-The bot emails you when it finds a code. Set up a Shortcut automation that
-triggers on **mail from yourself** with "Chipotle Code Found" in the subject.
+Apple Shortcuts can also react to ntfy notifications via the **ntfy app automations**.
 
 ### Option B – Poll the local HTTP server
-Add a Shortcut that runs on a schedule (every 5 min):
 
-1. **Get Contents of URL** → `http://localhost:8080/code`
-   *(Mac must be on the same network; use your Mac's local IP if running from iPhone)*
+Add a Shortcut that runs on a timer (every 5 min):
+
+1. **Get Contents of URL** → `http://YOUR-MAC-LOCAL-IP:8080/code`
+   (find your Mac's IP: System Settings → Wi-Fi → Details)
 2. **If** result ≠ `NO_CODE_YET`
 3. **Send Message** (or copy to clipboard)
 
