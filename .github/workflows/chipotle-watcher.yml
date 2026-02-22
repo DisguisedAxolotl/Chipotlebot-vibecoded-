@@ -1,0 +1,45 @@
+name: Chipotle Code Watcher (fallback)
+# ⚠️  GitHub Actions minimum interval is 5 minutes.
+# For near-instant detection, use Render.com (render.yaml in this repo).
+# This workflow is a fallback / redundancy layer.
+
+on:
+  schedule:
+    - cron: "*/5 * * * *"   # every 5 minutes (GitHub minimum)
+  workflow_dispatch:          # manual trigger from the Actions tab
+
+jobs:
+  watch:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      # Restore seen-codes state from previous runs
+      - uses: actions/cache@v4
+        with:
+          path: seen_codes.json
+          key: seen-codes-${{ github.run_id }}
+          restore-keys: seen-codes-
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Check for codes
+        env:
+          NTFY_TOPIC:     ${{ secrets.NTFY_TOPIC }}
+          SHORTCUT_NAME:  ${{ secrets.SHORTCUT_NAME }}
+          SMTP_USER:      ${{ secrets.SMTP_USER }}
+          SMTP_PASS:      ${{ secrets.SMTP_PASS }}
+          NOTIFY_EMAIL:   ${{ secrets.NOTIFY_EMAIL }}
+        run: python watch.py --once
+
+      # Save updated state so next run knows what was already found
+      - uses: actions/cache/save@v4
+        if: always()
+        with:
+          path: seen_codes.json
+          key: seen-codes-${{ github.run_id }}

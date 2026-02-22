@@ -1,26 +1,29 @@
 #!/usr/bin/env python3
 """
 Chipotle code watcher
-Polls @ChipotleTweets on X every few minutes, extracts promo codes,
-pushes a notification via ntfy.sh (free, no account needed), and serves
-the latest code at http://localhost:8080/code for Apple Shortcuts polling.
 
-Optional: also sends email if SMTP credentials are set.
+Two modes:
+  python watch.py           – continuous loop (Render.com / local)
+  python watch.py --once    – single check then exit (GitHub Actions fallback)
+
+Scraping: nitter RSS feeds first (fast, lightweight), then HTML fallback.
+Notifications: ntfy.sh push + optional email.
 """
 
+import argparse
+import json
 import os
 import re
 import smtplib
-import time
-import json
 import threading
+import time
 import logging
+import xml.etree.ElementTree as ET
 from email.mime.text import MIMEText
 from http.server import HTTPServer, BaseHTTPRequestHandler
-from urllib.request import urlopen, Request
-from urllib.error import URLError
-from urllib.parse import urlencode
 from html.parser import HTMLParser
+from urllib.parse import quote
+from urllib.request import urlopen, Request
 
 from dotenv import load_dotenv
 
@@ -33,27 +36,25 @@ logging.basicConfig(
 log = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
-# Config (all from .env)
+# Config
 # ---------------------------------------------------------------------------
-# ntfy.sh – free push notifications, no account needed
-# Pick any secret topic name, e.g. "chipotle-hunter-abc123"
-NTFY_TOPIC          = os.getenv("NTFY_TOPIC", "")         # e.g. chipotle-codes-abc123
-# Name of your Apple Shortcut that accepts the code as text input.
-# Leave blank to skip the action button.
-SHORTCUT_NAME       = os.getenv("SHORTCUT_NAME", "")      # e.g. "Chipotle Code"
+NTFY_TOPIC     = os.getenv("NTFY_TOPIC", "")
+SHORTCUT_NAME  = os.getenv("SHORTCUT_NAME", "")
 
-# Email (optional – leave blank to skip)
-SMTP_HOST     = os.getenv("SMTP_HOST", "smtp.gmail.com")
-SMTP_PORT     = int(os.getenv("SMTP_PORT", "587"))
-SMTP_USER     = os.getenv("SMTP_USER", "")
-SMTP_PASS     = os.getenv("SMTP_PASS", "")
-NOTIFY_EMAIL  = os.getenv("NOTIFY_EMAIL", "")
+SMTP_HOST      = os.getenv("SMTP_HOST", "smtp.gmail.com")
+SMTP_PORT      = int(os.getenv("SMTP_PORT", "587"))
+SMTP_USER      = os.getenv("SMTP_USER", "")
+SMTP_PASS      = os.getenv("SMTP_PASS", "")
+NOTIFY_EMAIL   = os.getenv("NOTIFY_EMAIL", "")
 
-HTTP_PORT     = int(os.getenv("HTTP_PORT", "8080"))
-POLL_SECONDS  = int(os.getenv("POLL_SECONDS", "300"))  # default: 5 min
+HTTP_PORT      = int(os.getenv("HTTP_PORT", "8080"))
+# 30 seconds default – fast enough to catch a code within ~1 min of posting
+POLL_SECONDS   = int(os.getenv("POLL_SECONDS", "30"))
+
+STATE_FILE     = "seen_codes.json"
 
 # ---------------------------------------------------------------------------
-# Nitter instances to try (in order)
+# Nitter instances
 # ---------------------------------------------------------------------------
 NITTER_INSTANCES = [
     "https://nitter.poast.org",
@@ -68,15 +69,11 @@ CHIPOTLE_HANDLE = "ChipotleTweets"
 # ---------------------------------------------------------------------------
 # Code detection
 # ---------------------------------------------------------------------------
-# Chipotle codes are typically ALL-CAPS, 4–20 chars, alphanumeric.
-# We tighten the match by requiring they appear near code-related words
-# OR are standalone quoted/highlighted in the tweet.
 RAW_CODE_RE = re.compile(r'\b([A-Z][A-Z0-9]{3,19})\b')
 CONTEXT_WORDS = re.compile(
     r'\b(code|promo|enter|use|redeem|free|bowl|burrito|discount|off|bogo)\b',
     re.IGNORECASE,
 )
-# These common English words are NOT codes – skip them
 STOPWORDS = {
     "RETWEET", "FOLLOW", "TWITTER", "CHIPOTLE", "CHIPOTLETWEETS",
     "TODAY", "MONDAY", "TUESDAY", "WEDNESDAY", "THURSDAY", "FRIDAY",
@@ -85,26 +82,25 @@ STOPWORDS = {
     "DECEMBER", "THANK", "THANKS", "HAPPY", "ENJOY", "LIMITED",
     "OFFER", "LINK", "CLICK", "HERE", "MORE", "INFO", "TERMS",
     "CONDITIONS", "VALID", "ONLY", "WHILE", "SUPPLIES", "LAST",
+    "HTTPS", "HTTP", "WITH", "YOUR", "WILL", "HAVE", "THIS",
+    "THAT", "FROM", "THEY", "BEEN", "THEIR", "THERE", "WERE",
 }
 
+
 def extract_codes(text: str) -> list[str]:
-    """Return candidate promo codes from a tweet body."""
     candidates = RAW_CODE_RE.findall(text)
     codes = []
     for c in candidates:
         if c in STOPWORDS:
             continue
-        if len(c) < 4:
-            continue
-        # Require a nearby context word OR the code looks quote-surrounded
         window = text[max(0, text.find(c) - 80): text.find(c) + len(c) + 80]
         if CONTEXT_WORDS.search(window) or f'"{c}"' in text or f"'{c}'" in text:
             codes.append(c)
-    return list(dict.fromkeys(codes))  # deduplicate, preserve order
+    return list(dict.fromkeys(codes))
 
 
 # ---------------------------------------------------------------------------
-# Scraping helpers
+# HTTP helpers
 # ---------------------------------------------------------------------------
 HEADERS = {
     "User-Agent": (
@@ -116,8 +112,52 @@ HEADERS = {
 }
 
 
+def _get(url: str, timeout: int = 10) -> str | None:
+    try:
+        req = Request(url, headers=HEADERS)
+        with urlopen(req, timeout=timeout) as r:
+            return r.read().decode("utf-8", errors="replace")
+    except Exception as e:
+        log.debug("GET %s failed: %s", url, e)
+        return None
+
+
+# ---------------------------------------------------------------------------
+# Scrapers – RSS first (fast/light), HTML fallback
+# ---------------------------------------------------------------------------
+def fetch_tweets_rss() -> list[str]:
+    """Parse nitter RSS feeds – much faster and lighter than full HTML scraping."""
+    for instance in NITTER_INSTANCES:
+        url = f"{instance}/{CHIPOTLE_HANDLE}/rss"
+        log.debug("Trying RSS: %s", url)
+        xml = _get(url, timeout=8)
+        if not xml:
+            continue
+        try:
+            root = ET.fromstring(xml)
+            # RSS items are under channel/item; text is in <title> or <description>
+            ns = {"media": "http://search.yahoo.com/mrss/"}
+            items = root.findall(".//item")
+            if not items:
+                continue
+            texts = []
+            for item in items[:20]:
+                title = item.findtext("title") or ""
+                desc = item.findtext("description") or ""
+                # Strip HTML tags from description
+                clean = re.sub(r"<[^>]+>", " ", desc)
+                combined = f"{title} {clean}".strip()
+                if combined:
+                    texts.append(combined)
+            if texts:
+                log.info("RSS: got %d items from %s", len(texts), instance)
+                return texts
+        except ET.ParseError as e:
+            log.debug("RSS parse error from %s: %s", instance, e)
+    return []
+
+
 class TweetStripper(HTMLParser):
-    """Minimal HTML parser that collects visible text from tweet divs."""
     def __init__(self):
         super().__init__()
         self.in_tweet = 0
@@ -125,9 +165,8 @@ class TweetStripper(HTMLParser):
         self._current = []
 
     def handle_starttag(self, tag, attrs):
-        attr_dict = dict(attrs)
-        cls = attr_dict.get("class", "")
-        if "tweet-content" in cls or "tweet-text" in cls or "tgme_widget_message_text" in cls:
+        cls = dict(attrs).get("class", "")
+        if "tweet-content" in cls or "tweet-text" in cls:
             self.in_tweet += 1
 
     def handle_endtag(self, tag):
@@ -142,94 +181,71 @@ class TweetStripper(HTMLParser):
             self._current.append(data.strip())
 
 
-def _get(url: str, timeout: int = 10) -> str | None:
-    try:
-        req = Request(url, headers=HEADERS)
-        with urlopen(req, timeout=timeout) as r:
-            return r.read().decode("utf-8", errors="replace")
-    except Exception as e:
-        log.debug("GET %s failed: %s", url, e)
-        return None
-
-
-def fetch_tweets_nitter() -> list[str]:
+def fetch_tweets_html() -> list[str]:
     for instance in NITTER_INSTANCES:
         url = f"{instance}/{CHIPOTLE_HANDLE}"
-        log.info("Trying nitter: %s", url)
         html = _get(url)
         if not html:
             continue
         parser = TweetStripper()
         parser.feed(html)
         if parser.texts:
-            log.info("Got %d tweets from %s", len(parser.texts), instance)
+            log.info("HTML: got %d tweets from %s", len(parser.texts), instance)
             return parser.texts[:20]
-        # Fallback: grab all visible text and look for code patterns anyway
         raw_text = re.sub(r"<[^>]+>", " ", html)
         if CHIPOTLE_HANDLE.lower() in raw_text.lower():
-            log.info("Partial parse from %s", instance)
             return [raw_text[:4000]]
     return []
 
 
 def fetch_tweets_syndication() -> list[str]:
-    """
-    X's public syndication endpoint – works without an API key for
-    recent timeline embeds. Hit-or-miss depending on X's changes.
-    """
     url = (
         "https://cdn.syndication.twimg.com/timeline/profile"
         f"?screen_name={CHIPOTLE_HANDLE}&count=20"
     )
-    log.info("Trying X syndication: %s", url)
     data = _get(url)
     if not data:
         return []
     try:
         obj = json.loads(data)
-        # The body field contains rendered HTML
         html = obj.get("body", "")
         if html:
             parser = TweetStripper()
             parser.feed(html)
             if parser.texts:
                 return parser.texts[:20]
-        # Fallback: regex on raw JSON
-        raw = re.sub(r"\\n|\\r", " ", data)
-        return [raw[:4000]]
+        return [re.sub(r"\\n|\\r", " ", data)[:4000]]
     except json.JSONDecodeError:
         return []
 
 
 def get_all_tweet_texts() -> list[str]:
-    texts = fetch_tweets_nitter()
+    # RSS is fastest – try it first
+    texts = fetch_tweets_rss()
     if not texts:
+        log.info("RSS failed, trying HTML scrape…")
+        texts = fetch_tweets_html()
+    if not texts:
+        log.info("HTML failed, trying syndication…")
         texts = fetch_tweets_syndication()
     return texts
 
 
 # ---------------------------------------------------------------------------
-# ntfy.sh – push notification (no account needed)
+# Notifications
 # ---------------------------------------------------------------------------
-def send_ntfy(code: str, tweet_snippet: str) -> bool:
+def send_ntfy(code: str, snippet: str) -> bool:
     if not NTFY_TOPIC:
         return False
     url = f"https://ntfy.sh/{NTFY_TOPIC}"
-    payload = f"CODE: {code}\n\n{tweet_snippet[:200]}".encode()
-
+    payload = f"CODE: {code}\n\n{snippet[:200]}".encode()
     headers = {
         "Title": f"Chipotle Code: {code}",
         "Priority": "urgent",
         "Tags": "chipotle,tada",
         "Content-Type": "text/plain",
     }
-
-    # Add a tap-to-run action button if a Shortcut name is configured.
-    # iOS URL scheme: shortcuts://run-shortcut?name=NAME&input=text&text=CODE
-    # Tapping "Send Code" in the notification opens your Shortcut with the
-    # code already passed in as the input text.
     if SHORTCUT_NAME:
-        from urllib.parse import quote
         shortcut_url = (
             f"shortcuts://run-shortcut"
             f"?name={quote(SHORTCUT_NAME)}"
@@ -237,56 +253,60 @@ def send_ntfy(code: str, tweet_snippet: str) -> bool:
             f"&text={quote(code)}"
         )
         headers["Actions"] = f"view, Send Code to Shortcut, {shortcut_url}"
-
-    req = Request(
-        url,
-        data=payload,
-        headers=headers,
-        method="POST",
-    )
+    req = Request(url, data=payload, headers=headers, method="POST")
     try:
         with urlopen(req, timeout=10) as r:
             r.read()
-        log.info("ntfy.sh notification sent for code: %s", code)
+        log.info("ntfy sent: %s", code)
         return True
     except Exception as e:
-        log.error("ntfy.sh failed: %s", e)
+        log.error("ntfy failed: %s", e)
         return False
 
 
-# ---------------------------------------------------------------------------
-# Email (optional)
-# ---------------------------------------------------------------------------
-def send_email(code: str, tweet_snippet: str) -> bool:
+def send_email(code: str, snippet: str) -> bool:
     if not all([SMTP_USER, SMTP_PASS, NOTIFY_EMAIL]):
-        log.warning("Email not configured – skipping send (code: %s)", code)
         return False
-    subject = f"Chipotle Code Found: {code}"
-    body = (
-        f"Promo code detected from @ChipotleTweets:\n\n"
-        f"  CODE: {code}\n\n"
-        f"Tweet context:\n{tweet_snippet}\n\n"
-        f"-- Chipotle Watcher"
+    msg = MIMEText(
+        f"Promo code from @ChipotleTweets:\n\n  CODE: {code}\n\n{snippet}\n\n-- Chipotle Watcher"
     )
-    msg = MIMEText(body)
-    msg["Subject"] = subject
+    msg["Subject"] = f"Chipotle Code Found: {code}"
     msg["From"] = SMTP_USER
     msg["To"] = NOTIFY_EMAIL
     try:
         with smtplib.SMTP(SMTP_HOST, SMTP_PORT) as s:
-            s.ehlo()
-            s.starttls()
-            s.login(SMTP_USER, SMTP_PASS)
+            s.ehlo(); s.starttls(); s.login(SMTP_USER, SMTP_PASS)
             s.sendmail(SMTP_USER, [NOTIFY_EMAIL], msg.as_string())
-        log.info("Email sent for code: %s", code)
+        log.info("Email sent: %s", code)
         return True
     except Exception as e:
         log.error("Email failed: %s", e)
         return False
 
 
+def notify(code: str, snippet: str):
+    send_ntfy(code, snippet)
+    send_email(code, snippet)
+
+
 # ---------------------------------------------------------------------------
-# HTTP server – Apple Shortcuts polls http://localhost:8080/code
+# State persistence (--once mode)
+# ---------------------------------------------------------------------------
+def load_seen() -> set[str]:
+    try:
+        with open(STATE_FILE) as f:
+            return set(json.load(f))
+    except (FileNotFoundError, json.JSONDecodeError):
+        return set()
+
+
+def save_seen(seen: set[str]):
+    with open(STATE_FILE, "w") as f:
+        json.dump(sorted(seen), f)
+
+
+# ---------------------------------------------------------------------------
+# Local HTTP server (continuous mode)
 # ---------------------------------------------------------------------------
 latest_code: dict = {"code": "", "context": "", "found_at": ""}
 latest_lock = threading.Lock()
@@ -296,78 +316,99 @@ class CodeHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         with latest_lock:
             code = latest_code["code"]
-            context = latest_code["context"]
-            found_at = latest_code["found_at"]
-        if self.path in ("/code", "/code/"):
+        if self.path.rstrip("/") == "/code":
             body = (code or "NO_CODE_YET").encode()
             self.send_response(200)
             self.send_header("Content-Type", "text/plain")
             self.end_headers()
             self.wfile.write(body)
-        elif self.path in ("/status", "/status/"):
-            payload = json.dumps({
-                "code": code,
-                "context": context,
-                "found_at": found_at,
-            }).encode()
+        elif self.path.rstrip("/") == "/status":
+            with latest_lock:
+                payload = json.dumps(latest_code).encode()
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
             self.end_headers()
             self.wfile.write(payload)
         else:
-            self.send_response(404)
-            self.end_headers()
+            self.send_response(404); self.end_headers()
 
-    def log_message(self, fmt, *args):  # silence default httpd logs
+    def log_message(self, *_):
         pass
 
 
-def start_http_server():
-    srv = HTTPServer(("0.0.0.0", HTTP_PORT), CodeHandler)
-    log.info("HTTP server on http://localhost:%d/code", HTTP_PORT)
-    srv.serve_forever()
-
-
 # ---------------------------------------------------------------------------
-# Main loop
+# Entry points
 # ---------------------------------------------------------------------------
-def main():
-    seen_codes: set[str] = set()
+def run_once():
+    """Single check – for GitHub Actions / cron (slower, ~5 min cadence)."""
+    seen = load_seen()
+    tweets = get_all_tweet_texts()
+    if not tweets:
+        log.warning("No tweets retrieved")
+        return
+    found_any = False
+    for tweet in tweets:
+        for code in extract_codes(tweet):
+            if code not in seen:
+                seen.add(code)
+                snippet = tweet[:200].replace("\n", " ")
+                log.info("NEW CODE: %s | %s", code, snippet)
+                notify(code, snippet)
+                found_any = True
+    save_seen(seen)
+    if not found_any:
+        log.info("No new codes this run.")
 
-    http_thread = threading.Thread(target=start_http_server, daemon=True)
-    http_thread.start()
+
+def run_loop():
+    """
+    Continuous loop – runs on Render.com / local.
+    Polls every POLL_SECONDS (default 30) for near-instant detection.
+    """
+    seen: set[str] = set()
+
+    # HTTP server for local Apple Shortcuts polling
+    threading.Thread(
+        target=lambda: HTTPServer(("0.0.0.0", HTTP_PORT), CodeHandler).serve_forever(),
+        daemon=True,
+    ).start()
+    log.info("HTTP server → http://localhost:%d/code", HTTP_PORT)
 
     log.info(
-        "Watcher started. Polling @%s every %ds. ntfy → %s | Email → %s",
-        CHIPOTLE_HANDLE, POLL_SECONDS,
-        NTFY_TOPIC or "(not configured)",
-        NOTIFY_EMAIL or "(not configured)",
+        "Polling @%s every %ds | ntfy=%s",
+        CHIPOTLE_HANDLE, POLL_SECONDS, NTFY_TOPIC or "off",
     )
 
     while True:
         try:
             tweets = get_all_tweet_texts()
-            if not tweets:
-                log.warning("No tweets retrieved this round")
             for tweet in tweets:
-                codes = extract_codes(tweet)
-                for code in codes:
-                    if code not in seen_codes:
-                        seen_codes.add(code)
+                for code in extract_codes(tweet):
+                    if code not in seen:
+                        seen.add(code)
                         snippet = tweet[:200].replace("\n", " ")
-                        log.info("NEW CODE FOUND: %s  |  %s", code, snippet)
+                        log.info("NEW CODE: %s | %s", code, snippet)
                         with latest_lock:
-                            latest_code["code"] = code
-                            latest_code["context"] = snippet
-                            latest_code["found_at"] = time.strftime("%Y-%m-%d %H:%M:%S")
-                        send_ntfy(code, snippet)
-                        send_email(code, snippet)
+                            latest_code.update(
+                                code=code, context=snippet,
+                                found_at=time.strftime("%Y-%m-%d %H:%M:%S"),
+                            )
+                        notify(code, snippet)
         except Exception as e:
             log.error("Poll error: %s", e)
 
-        log.info("Sleeping %ds until next poll…", POLL_SECONDS)
+        log.info("Next poll in %ds…", POLL_SECONDS)
         time.sleep(POLL_SECONDS)
 
 
 if __name__ == "__main__":
-    main()
+    parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "--once", action="store_true",
+        help="Single check then exit (GitHub Actions fallback, ~5 min cadence)",
+    )
+    args = parser.parse_args()
+    if args.once:
+        run_once()
+    else:
+        run_loop()

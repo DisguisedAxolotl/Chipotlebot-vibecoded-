@@ -1,0 +1,21 @@
+services:
+  - type: worker          # background worker – stays running 24/7, no sleep
+    name: chipotle-watcher
+    runtime: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: python watch.py
+    plan: free
+    envVars:
+      - key: NTFY_TOPIC
+        sync: false       # you'll fill this in the Render dashboard
+      - key: SHORTCUT_NAME
+        sync: false
+      - key: POLL_SECONDS
+        value: "30"       # check every 30 seconds
+      # Optional email (leave blank to skip)
+      - key: SMTP_USER
+        sync: false
+      - key: SMTP_PASS
+        sync: false
+      - key: NOTIFY_EMAIL
+        sync: false

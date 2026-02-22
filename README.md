@@ -1,67 +1,95 @@
 # Chipotle Code Watcher
 
-Polls @ChipotleTweets every 5 minutes, pulls out promo codes, emails them to you,
-and serves the latest code at `http://localhost:8080/code` for Apple Shortcuts.
-
-## Quick start (Mac)
-
-```bash
-# 1. Install deps (Python 3.11+ required)
-pip install -r requirements.txt
-
-# 2. Copy and fill in credentials
-cp env.example .env
-open -e .env      # or: nano .env
-
-# 3. Run it
-python watch.py
-```
-
-The terminal will log every poll. Leave it open tonight.
+Monitors @ChipotleTweets on X and pushes promo codes to your iPhone
+**within ~30 seconds** of them being posted.
 
 ---
 
-## Notification setup (pick one)
+## How it works
 
-### Option A – ntfy.sh push notification (EASIEST, recommended)
+```
+X / nitter RSS feed (polled every 30s)
+        ↓ new code found
+  ntfy.sh push notification
+        ↓ tap "Send Code to Shortcut"
+  Apple Shortcut runs with code as input
+        ↓
+  iMessage sent to yourself (or clipboard, or whatever)
+```
 
-No account needed. Free. Works great with Apple Shortcuts.
+---
 
-1. Install the free **[ntfy app](https://apps.apple.com/app/ntfy/id1625396347)** on your iPhone
-2. In `.env`, set `NTFY_TOPIC` to any secret string, e.g. `chipotle-free-bowl-abc987`
-3. In the ntfy app, tap **+** and subscribe to that same topic name
-4. Done — you'll get an instant push when a code is found
+## Fastest setup: Render.com (free, no server, ~30s detection)
 
-#### Shortcut deep-link (tap → code auto-sent)
+**1. Deploy**
 
-1. In the **Shortcuts app**, create a new Shortcut named e.g. `Chipotle Code`
-2. Add these actions:
-   - **Receive input from** → Quick Actions, Share Sheet, Shortcuts app
-   - **Send Message** → body = `Shortcut Input` → to yourself
-     *(or Copy to Clipboard, or whatever you want)*
-3. In `.env`, set `SHORTCUT_NAME=Chipotle Code`
+[![Deploy to Render](https://render.com/images/deploy-to-render-button.svg)](https://render.com/deploy)
 
-Now when the ntfy notification arrives, tap **"Send Code to Shortcut"** and
-iOS instantly runs your Shortcut with the code as the input — no copy-paste needed.
+Or manually:
+1. Go to [render.com](https://render.com) → sign up free (no credit card)
+2. New → **Background Worker** → connect this GitHub repo
+3. Render auto-detects `render.yaml` and configures everything
 
-### Option B – Poll the local HTTP server
+**2. Set environment variables** in the Render dashboard:
 
-Add a Shortcut that runs on a timer (every 5 min):
+| Variable | Value |
+|---|---|
+| `NTFY_TOPIC` | your secret topic name, e.g. `chipotle-bowl-abc987` |
+| `SHORTCUT_NAME` | name of your Apple Shortcut (optional) |
+| `POLL_SECONDS` | `30` (already set in render.yaml) |
 
-1. **Get Contents of URL** → `http://YOUR-MAC-LOCAL-IP:8080/code`
-   (find your Mac's IP: System Settings → Wi-Fi → Details)
-2. **If** result ≠ `NO_CODE_YET`
-3. **Send Message** (or copy to clipboard)
+**3. Deploy** → it starts polling immediately, runs forever, free.
 
-`/status` returns JSON with `{ "code", "context", "found_at" }` if you need more detail.
+---
+
+## Alternative: GitHub Actions (free, ~5 min detection)
+
+Slower than Render (GitHub minimum cron is 5 minutes) but zero setup.
+
+Add these as **repository secrets** (Settings → Secrets → Actions):
+- `NTFY_TOPIC`
+- `SHORTCUT_NAME` (optional)
+
+The workflow (`.github/workflows/chipotle-watcher.yml`) runs automatically.
+Enable it under the **Actions** tab if needed.
+
+---
+
+## Notification setup
+
+### ntfy.sh push (recommended, no account needed)
+
+1. Install the free **ntfy** app on iPhone (App Store)
+2. In the ntfy app, tap **+** → subscribe to your topic name
+3. Set `NTFY_TOPIC` to the same name in your deployment
+
+#### Shortcut deep-link (one tap → code auto-sent)
+
+1. Shortcuts app → **+** → name it e.g. `Chipotle Code`
+2. Add: **Receive input from** → Quick Actions
+3. Add: **Send Message** → body = *Shortcut Input* → recipient = yourself
+4. Set `SHORTCUT_NAME=Chipotle Code` in your deployment
+
+When the notification arrives, tap **"Send Code to Shortcut"** → code is
+instantly texted to you. No copy-paste.
+
+---
+
+## Local run (Mac)
+
+```bash
+pip install -r requirements.txt
+cp env.example .env
+# edit .env
+python watch.py           # continuous, polls every 30s
+python watch.py --once    # single check then exit
+```
 
 ---
 
 ## How codes are detected
 
-The scraper tries, in order:
-1. Several public **nitter** mirrors of X (no API key needed)
-2. X's **syndication** embed endpoint
-
-It then scans each tweet for ALL-CAPS strings 4–20 characters long that appear
-near words like "code", "promo", "enter", "redeem", "free", etc.
+- Fetches nitter **RSS feeds** first (fast, lightweight XML)
+- Falls back to nitter HTML scraping, then X syndication endpoint
+- Extracts ALL-CAPS strings 4–20 chars long that appear near words
+  like "code", "promo", "enter", "redeem", "free", "bowl", etc.
